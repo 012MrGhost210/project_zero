@@ -1,249 +1,133 @@
-"""Streamlit UI: read-only disk usage analytics.
-
-Never writes under scanned paths — analytics only.
-"""
+"""Read-only disk usage monitor (Streamlit). Never writes under scanned paths."""
 
 from __future__ import annotations
 
+import heapq
+import os
 import time
-from datetime import datetime
+from pathlib import Path
 
-import pandas as pd
 import streamlit as st
 
-from disk_scanner import (
-    human_size,
-    is_under,
-    resolve_existing_dir,
-    scan_directory,
-    volume_info,
+st.set_page_config(page_title="Мониторинг диска", layout="wide")
+
+st.title("Мониторинг диска")
+st.info(
+    "**Только чтение.** Приложение ничего не создаёт, не меняет и не удаляет "
+    "в указанных каталогах — только анализ через os.scandir / os.statvfs."
 )
 
-st.set_page_config(
-    page_title="Мониторинг диска",
-    page_icon="💾",
-    layout="wide",
-)
 
-st.markdown(
-    """
-    <style>
-      .block-container { padding-top: 1.5rem; max-width: 1100px; }
-      .readonly-banner {
-        background: linear-gradient(90deg, #e8f5e9 0%, #f1f8e9 100%);
-        border: 1px solid #a5d6a7;
-        border-radius: 8px;
-        padding: 0.75rem 1rem;
-        margin-bottom: 1rem;
-        color: #1b5e20;
-        font-size: 0.95rem;
-      }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+def human(n: int) -> str:
+    for u in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or u == "TB":
+            return f"{n:.0f} {u}" if u == "B" else f"{n:.1f} {u}"
+        n /= 1024
+    return f"{n:.1f} TB"
 
-st.title("Мониторинг использования диска")
-st.markdown(
-    '<div class="readonly-banner">'
-    "<strong>Только чтение.</strong> Приложение анализирует каталоги и ничего "
-    "не создаёт, не изменяет, не удаляет, не перемещает и не меняет права. "
-    "Очистка и правки файловой системы здесь недоступны."
-    "</div>",
-    unsafe_allow_html=True,
-)
+
+def scan(root: Path, top_n: int = 15):
+    """Walk root read-only. Returns total, top child folders, top files, errors."""
+    errors: list[str] = []
+    child_bytes: dict[str, int] = {}
+    files_heap: list[tuple[int, str]] = []  # min-heap (size, path)
+    total = 0
+    stack = [root]
+
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    try:
+                        if entry.is_symlink():
+                            continue
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(Path(entry.path))
+                            continue
+                        if not entry.is_file(follow_symlinks=False):
+                            continue
+                        size = entry.stat(follow_symlinks=False).st_size
+                        total += size
+                        # Attribute to immediate child of root
+                        try:
+                            rel = Path(entry.path).relative_to(root)
+                            key = str(root / rel.parts[0]) if rel.parts else str(root)
+                        except ValueError:
+                            key = str(current)
+                        child_bytes[key] = child_bytes.get(key, 0) + size
+
+                        if len(files_heap) < top_n:
+                            heapq.heappush(files_heap, (size, entry.path))
+                        elif size > files_heap[0][0]:
+                            heapq.heapreplace(files_heap, (size, entry.path))
+                    except OSError as e:
+                        if len(errors) < 20:
+                            errors.append(str(e))
+        except OSError as e:
+            if len(errors) < 20:
+                errors.append(f"{current}: {e}")
+
+    folders = sorted(child_bytes.items(), key=lambda x: x[1], reverse=True)[:top_n]
+    files = sorted(files_heap, key=lambda x: x[0], reverse=True)
+    return total, folders, files, errors
+
 
 with st.sidebar:
-    st.header("Параметры")
-    main_raw = st.text_input(
-        "Корневой / основной каталог",
-        value="/workspace",
-        help="Базовый контекст (например, точка монтирования или общий корень).",
-        key="main_path",
-    )
-    selected_raw = st.text_input(
-        "Наблюдаемый каталог",
-        value="/workspace",
-        help="Каталог, который нужно просканировать.",
-        key="selected_path",
-    )
-    top_n = st.slider("Топ N папок и файлов", min_value=5, max_value=50, value=15, step=5)
-    auto_refresh = st.checkbox(
-        "Автообновление",
-        value=False,
-        help="Периодически пересканировать наблюдаемый каталог.",
-    )
-    refresh_sec = 0
-    if auto_refresh:
-        refresh_sec = st.slider(
-            "Интервал (сек)",
-            min_value=5,
-            max_value=120,
-            value=15,
-            step=5,
-        )
-    refresh_now = st.button("Обновить сейчас", type="primary", use_container_width=True)
-    st.caption(
-        "Сканирование только через os.scandir / pathlib / os.statvfs — без записи."
-    )
+    main = st.text_input("Основной каталог (контекст)", value=r"C:\data" if os.name == "nt" else "/workspace")
+    watched = st.text_input("Наблюдаемый каталог", value=main)
+    top_n = st.number_input("Топ N", min_value=5, max_value=50, value=15, step=5)
+    auto = st.checkbox("Автообновление", value=False)
+    interval = st.slider("Интервал, сек", 5, 60, 15) if auto else 0
+    do_scan = st.button("Сканировать", type="primary") or True
 
+path = Path(watched.strip()).expanduser() if watched.strip() else None
+main_path = Path(main.strip()).expanduser() if main.strip() else None
 
-def _rows_from_path_sizes(items) -> pd.DataFrame:
-    rows = [
-        {
-            "Путь": item.path,
-            "Размер": human_size(item.size_bytes),
-            "Байты": item.size_bytes,
-        }
-        for item in items
-    ]
-    if not rows:
-        return pd.DataFrame(columns=["Путь", "Размер", "Байты"])
-    return pd.DataFrame(rows)
-
-
-@st.cache_data(ttl=5, show_spinner=False)
-def _cached_scan(path_str: str, top_n: int, bust: float):
-    del bust  # cache key only
-    target = resolve_existing_dir(path_str)
-    return scan_directory(target, top_n=top_n)
-
-
-if "scan_bust" not in st.session_state:
-    st.session_state.scan_bust = time.time()
-if refresh_now:
-    st.session_state.scan_bust = time.time()
-    st.cache_data.clear()
-
-# --- Validate paths ---
-main_path = None
-selected_path = None
-path_error = None
-
-try:
-    if main_raw.strip():
-        main_path = resolve_existing_dir(main_raw)
-except (ValueError, FileNotFoundError, NotADirectoryError, PermissionError) as exc:
-    path_error = ("main", str(exc))
-
-try:
-    selected_path = resolve_existing_dir(selected_raw)
-except (ValueError, FileNotFoundError, NotADirectoryError, PermissionError) as exc:
-    path_error = ("selected", str(exc))
-
-if path_error is not None:
-    kind, message = path_error
-    label = "основного" if kind == "main" else "наблюдаемого"
-    lower = message.lower()
-    if "не существует" in lower or "не указан" in lower:
-        st.warning(f"Некорректный путь {label} каталога: {message}")
-    elif "прав" in lower or "доступ" in lower:
-        st.error(f"Ошибка доступа к {label} каталогу: {message}")
-    else:
-        st.error(f"Не удалось открыть {label} каталог: {message}")
-    st.info("Укажите существующие каталоги, к которым есть права на чтение.")
-    if refresh_sec > 0:
-        time.sleep(min(refresh_sec, 5))
-        st.rerun()
+if not path or not path.exists() or not path.is_dir():
+    st.warning("Укажите существующий каталог в поле «Наблюдаемый каталог».")
     st.stop()
 
-assert selected_path is not None
+if not os.access(path, os.R_OK):
+    st.error(f"Нет прав на чтение: {path}")
+    st.stop()
 
-# --- Scan (read-only) ---
 with st.spinner("Сканирование (только чтение)…"):
-    try:
-        result = _cached_scan(str(selected_path), top_n, st.session_state.scan_bust)
-    except PermissionError as exc:
-        st.error(f"Нет прав на сканирование: {exc}")
-        st.stop()
-    except OSError as exc:
-        st.error(f"Ошибка сканирования: {exc}")
-        st.stop()
+    total, folders, files, errors = scan(path, int(top_n))
 
-vol = volume_info(main_path) if main_path is not None else None
-related = main_path is not None and (
-    is_under(selected_path, main_path) or selected_path == main_path
-)
+# Volume free space (read-only), based on main path if given
+vol_path = main_path if main_path and main_path.exists() else path
+try:
+    stv = os.statvfs(vol_path)
+    fr = stv.f_frsize or stv.f_bsize
+    free = stv.f_bavail * fr
+    vol_total = stv.f_blocks * fr
+except (OSError, AttributeError):
+    free = vol_total = None
 
-col1, col2, col3, col4 = st.columns(4)
-with col1:
-    st.metric("Размер наблюдаемого", human_size(result.total_bytes))
-    if related and vol is not None and vol.total_bytes:
-        share = result.total_bytes / vol.total_bytes * 100
-        st.caption(f"{share:.2f}% от объёма тома")
-with col2:
-    if vol is not None:
-        st.metric("Свободно на томе", human_size(vol.available_bytes))
-        st.caption(f"Том: `{main_path}`")
+c1, c2, c3 = st.columns(3)
+c1.metric("Размер каталога", human(total))
+c2.metric("Свободно на томе", human(free) if free is not None else "—")
+c3.metric("Объём тома", human(vol_total) if vol_total is not None else "—")
+st.caption(f"Путь: `{path}`")
+
+t1, t2 = st.tabs(["Тяжёлые папки (1-й уровень)", "Тяжёлые файлы"])
+with t1:
+    if not folders:
+        st.write("Нет данных.")
     else:
-        st.metric("Свободно на томе", "—")
-        st.caption("statvfs недоступен")
-with col3:
-    if vol is not None:
-        used = vol.total_bytes - vol.free_bytes
-        pct = (used / vol.total_bytes * 100) if vol.total_bytes else 0
-        st.metric("Занято на томе", f"{human_size(used)} ({pct:.0f}%)")
+        st.table([{"Путь": p, "Размер": human(s), "Байты": s} for p, s in folders])
+with t2:
+    if not files:
+        st.write("Нет данных.")
     else:
-        st.metric("Занято на томе", "—")
-with col4:
-    st.metric("Объём тома", human_size(vol.total_bytes) if vol else "—")
+        st.table([{"Путь": p, "Размер": human(s), "Байты": s} for s, p in files])
 
-if main_path is not None and not related:
-    st.caption(
-        f"Наблюдаемый путь не лежит внутри основного (`{main_path}`). "
-        "Метрики тома относятся к файловой системе основного каталога."
-    )
+if errors:
+    with st.expander(f"Ошибки доступа ({len(errors)})"):
+        for e in errors:
+            st.text(e)
 
-st.caption(
-    f"Обновлено: {datetime.now().strftime('%H:%M:%S')} · "
-    f"файлов учтено: {result.entries_seen} · "
-    f"путь: `{result.target}`"
-)
-
-if result.entries_seen == 0 and not result.errors:
-    st.info("Каталог пуст или не содержит доступных файлов (симлинки пропускаются).")
-
-if result.errors:
-    with st.expander(f"Предупреждения доступа ({len(result.errors)})", expanded=False):
-        for err in result.errors:
-            st.text(err)
-
-tab_folders, tab_files = st.tabs(["Самые тяжёлые папки", "Самые тяжёлые файлы"])
-
-with tab_folders:
-    df_folders = _rows_from_path_sizes(result.folders)
-    if df_folders.empty:
-        st.write("Нет подпапок для отображения.")
-    else:
-        st.dataframe(
-            df_folders,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Путь": st.column_config.TextColumn("Путь", width="large"),
-                "Размер": st.column_config.TextColumn("Размер", width="small"),
-                "Байты": st.column_config.NumberColumn("Байты", format="%d"),
-            },
-        )
-
-with tab_files:
-    df_files = _rows_from_path_sizes(result.files)
-    if df_files.empty:
-        st.write("Нет файлов для отображения.")
-    else:
-        st.dataframe(
-            df_files,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Путь": st.column_config.TextColumn("Путь", width="large"),
-                "Размер": st.column_config.TextColumn("Размер", width="small"),
-                "Байты": st.column_config.NumberColumn("Байты", format="%d"),
-            },
-        )
-
-if refresh_sec > 0:
-    st.caption(f"Автообновление каждые {refresh_sec} с.")
-    time.sleep(refresh_sec)
-    st.session_state.scan_bust = time.time()
+if interval > 0:
+    time.sleep(interval)
     st.rerun()
