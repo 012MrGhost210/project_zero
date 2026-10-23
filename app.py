@@ -1,12 +1,11 @@
 """Read-only disk usage monitor (Streamlit). Never writes under scanned paths."""
 
-from __future__ import annotations
-
 import heapq
 import os
 import shutil
 import time
 from pathlib import Path
+from typing import Dict, List, Tuple
 
 import streamlit as st
 
@@ -36,9 +35,9 @@ def pct(part: float, whole: float) -> str:
 
 def scan(root: Path, top_n: int = 15):
     """Walk root read-only. Returns total, top child folders, top files, errors."""
-    errors: list[str] = []
-    child_bytes: dict[str, int] = {}
-    files_heap: list[tuple[int, str]] = []
+    errors: List[str] = []
+    child_bytes: Dict[str, int] = {}
+    files_heap: List[Tuple[int, str]] = []
     total = 0
     stack = [root]
 
