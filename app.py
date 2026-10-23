@@ -68,14 +68,20 @@ with st.sidebar:
         key="selected_path",
     )
     top_n = st.slider("Топ N папок и файлов", min_value=5, max_value=50, value=15, step=5)
-    refresh_sec = st.slider(
-        "Интервал автообновления (сек)",
-        min_value=0,
-        max_value=120,
-        value=15,
-        step=5,
-        help="0 — без автообновления; нажмите «Обновить сейчас».",
+    auto_refresh = st.checkbox(
+        "Автообновление",
+        value=False,
+        help="Периодически пересканировать наблюдаемый каталог.",
     )
+    refresh_sec = 0
+    if auto_refresh:
+        refresh_sec = st.slider(
+            "Интервал (сек)",
+            min_value=5,
+            max_value=120,
+            value=15,
+            step=5,
+        )
     refresh_now = st.button("Обновить сейчас", type="primary", use_container_width=True)
     st.caption(
         "Сканирование только через os.scandir / pathlib / os.statvfs — без записи."
