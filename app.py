@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import heapq
 import os
+import shutil
 import time
 from pathlib import Path
 
@@ -14,23 +15,30 @@ st.set_page_config(page_title="Мониторинг диска", layout="wide")
 st.title("Мониторинг диска")
 st.info(
     "**Только чтение.** Приложение ничего не создаёт, не меняет и не удаляет "
-    "в указанных каталогах — только анализ через os.scandir / os.statvfs."
+    "в указанных каталогах — только анализ через os.scandir / shutil.disk_usage."
 )
 
 
-def human(n: int) -> str:
+def human(n: float) -> str:
+    x = float(n)
     for u in ("B", "KB", "MB", "GB", "TB"):
-        if n < 1024 or u == "TB":
-            return f"{n:.0f} {u}" if u == "B" else f"{n:.1f} {u}"
-        n /= 1024
-    return f"{n:.1f} TB"
+        if x < 1024 or u == "TB":
+            return f"{int(x)} {u}" if u == "B" else f"{x:.1f} {u}"
+        x /= 1024
+    return f"{x:.1f} TB"
+
+
+def pct(part: float, whole: float) -> str:
+    if not whole or whole <= 0:
+        return "—"
+    return f"{100.0 * part / whole:.2f}%"
 
 
 def scan(root: Path, top_n: int = 15):
     """Walk root read-only. Returns total, top child folders, top files, errors."""
     errors: list[str] = []
     child_bytes: dict[str, int] = {}
-    files_heap: list[tuple[int, str]] = []  # min-heap (size, path)
+    files_heap: list[tuple[int, str]] = []
     total = 0
     stack = [root]
 
@@ -49,7 +57,6 @@ def scan(root: Path, top_n: int = 15):
                             continue
                         size = entry.stat(follow_symlinks=False).st_size
                         total += size
-                        # Attribute to immediate child of root
                         try:
                             rel = Path(entry.path).relative_to(root)
                             key = str(root / rel.parts[0]) if rel.parts else str(root)
@@ -73,16 +80,17 @@ def scan(root: Path, top_n: int = 15):
     return total, folders, files, errors
 
 
+default_path = r"C:\Users" if os.name == "nt" else str(Path.home())
+
 with st.sidebar:
-    main = st.text_input("Основной каталог (контекст)", value=r"C:\data" if os.name == "nt" else "/workspace")
-    watched = st.text_input("Наблюдаемый каталог", value=main)
+    main = st.text_input("Основной каталог (контекст / том)", value=default_path)
+    watched = st.text_input("Наблюдаемый каталог", value=default_path)
     top_n = st.number_input("Топ N", min_value=5, max_value=50, value=15, step=5)
     auto = st.checkbox("Автообновление", value=False)
     interval = st.slider("Интервал, сек", 5, 60, 15) if auto else 0
-    do_scan = st.button("Сканировать", type="primary") or True
+    st.button("Обновить")
 
 path = Path(watched.strip()).expanduser() if watched.strip() else None
-main_path = Path(main.strip()).expanduser() if main.strip() else None
 
 if not path or not path.exists() or not path.is_dir():
     st.warning("Укажите существующий каталог в поле «Наблюдаемый каталог».")
@@ -95,33 +103,64 @@ if not os.access(path, os.R_OK):
 with st.spinner("Сканирование (только чтение)…"):
     total, folders, files, errors = scan(path, int(top_n))
 
-# Volume free space (read-only), based on main path if given
-vol_path = main_path if main_path and main_path.exists() else path
+vol_path = Path(main.strip()).expanduser() if main.strip() else path
+if not vol_path.exists():
+    vol_path = path
 try:
-    stv = os.statvfs(vol_path)
-    fr = stv.f_frsize or stv.f_bsize
-    free = stv.f_bavail * fr
-    vol_total = stv.f_blocks * fr
-except (OSError, AttributeError):
-    free = vol_total = None
+    usage = shutil.disk_usage(vol_path)
+    free, vol_total, vol_used = usage.free, usage.total, usage.used
+except OSError:
+    free = vol_total = vol_used = None
 
-c1, c2, c3 = st.columns(3)
+c1, c2, c3, c4 = st.columns(4)
 c1.metric("Размер каталога", human(total))
-c2.metric("Свободно на томе", human(free) if free is not None else "—")
-c3.metric("Объём тома", human(vol_total) if vol_total is not None else "—")
-st.caption(f"Путь: `{path}`")
+c2.metric(
+    "% от объёма диска",
+    pct(total, vol_total) if vol_total else "—",
+    help="Доля наблюдаемого каталога от полной ёмкости тома.",
+)
+c3.metric(
+    "% от занятого на диске",
+    pct(total, vol_used) if vol_used else "—",
+    help="Доля каталога от уже занятого места на томе.",
+)
+c4.metric("Свободно на томе", human(free) if free is not None else "—")
+st.caption(
+    f"Путь: `{path}` · том: `{vol_path}`"
+    + (f" · объём тома: {human(vol_total)}" if vol_total else "")
+)
 
 t1, t2 = st.tabs(["Тяжёлые папки (1-й уровень)", "Тяжёлые файлы"])
 with t1:
     if not folders:
         st.write("Нет данных.")
     else:
-        st.table([{"Путь": p, "Размер": human(s), "Байты": s} for p, s in folders])
+        st.table(
+            [
+                {
+                    "Путь": p,
+                    "Размер": human(s),
+                    "% от каталога": pct(s, total),
+                    "% от диска": pct(s, vol_total) if vol_total else "—",
+                }
+                for p, s in folders
+            ]
+        )
 with t2:
     if not files:
         st.write("Нет данных.")
     else:
-        st.table([{"Путь": p, "Размер": human(s), "Байты": s} for s, p in files])
+        st.table(
+            [
+                {
+                    "Путь": p,
+                    "Размер": human(s),
+                    "% от каталога": pct(s, total),
+                    "% от диска": pct(s, vol_total) if vol_total else "—",
+                }
+                for s, p in files
+            ]
+        )
 
 if errors:
     with st.expander(f"Ошибки доступа ({len(errors)})"):
